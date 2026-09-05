@@ -46,14 +46,24 @@ frame_idx 自动填**段中点**；VAE 按文件名自动匹配视频/音频 VAE
 ### 六、分辨率统一管理
 直接使用 **ComfyUI 官方 `Resolution Selector`** 内核节点（`分辨率=16:9`、`Megapixels=0.4`、`Multiple=32` 即 480P 档；官方全画质用 0.98MP），一处改动全段生效。「延长视频」生成的新段自动复制上一段的宽高来源，无需手动接线。
 
-## 安装
+## 安装（二选一）
+
+**方式一：git clone（推荐）**
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <本仓库地址>
+git clone https://github.com/Ccm-Tim/ComfyUI-H3-WorkflowHelper.git
 ```
 
-重启 ComfyUI。无任何 Python 第三方依赖（仅需内核自带模块）。
+**方式二：下载 ZIP**
+
+1. 仓库页绿色 **Code** 按钮 → **Download ZIP** → 解压
+2. 把解压出的 `ComfyUI-H3-WorkflowHelper-main` 文件夹**重命名为 `ComfyUI-H3-WorkflowHelper`**（去掉 `-main` 后缀）
+3. 整个文件夹放进 ComfyUI 的 `custom_nodes/` 目录（**注意：文件夹里应直接包含 `__init__.py` 和 `web/`**，不要多套一层）
+
+装完**重启 ComfyUI**，打开任一 MiniMax H3 节点即可看到按钮。
+
+**配套工作流**：仓库根目录的 `2026-09-04_H3分段视频工作流.json` 是配套模板，拖入 ComfyUI 画布即可使用（建议配合本插件）。
 
 ## 配套工作流
 
