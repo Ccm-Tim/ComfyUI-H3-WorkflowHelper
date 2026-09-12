@@ -1,15 +1,20 @@
-// ComfyUI-H3-WorkflowHelper · v1.1.0
+// ComfyUI-H3-WorkflowHelper · v1.5.0
 // 一期：插入参考图 / 参考音频 / 参考图+音频（已实测）
 // 二期：延长视频（接力新段）：克隆段链 + 接力桥自动算值 + 每段"视频长度"节点
 // 三期：Resolution Selector 配合（Python 侧节点，自动接线）
+// 四期（v1.5.0）：支持 R2V 结构（MiniMaxH3ReferenceToVideo 段根）：
+//   1) 延长视频 = 整段克隆最后一段（节点+排版+分组+改名+自动接线，含合并区槽位）；
+//   2) 插入参考图/音频时，VAE 优先接本段分组内的 Get_视频VAE / Get_音频VAE；
+//   3) 接力桥 batch_index 按上一段实际帧长自动重算。
 //
 // 设计原则：除"H3 分辨率选择"这一个纯透传节点外，只产出官方节点；
 // 删除本插件后，工作流仍是 100% 官方节点链。
 
 import { app } from "../../scripts/app.js";
-window.__H3_HELPER_VERSION = "1.4.5";
+window.__H3_HELPER_VERSION = "1.5.0";
 
-const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide"]);
+const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide", "MiniMaxH3ReferenceToVideo"]);
+const H3_ROOT_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo"]);
 const VIDEO_VAE_HINT = "video";
 const AUDIO_VAE_HINT = "audio";
 const VIDEO_VAE_FALLBACK = "minimax_h3_video_vae_fp16.safetensors";
@@ -84,14 +89,46 @@ function makeLoader(cls, graph, title, widgetName, hint) {
 function segmentRoot(node) {
     let cur = node;
     let guard = 0;
-    while (cur && cur.type !== "MiniMaxH3ImageToVideo" && guard++ < 16) {
+    while (cur && !H3_ROOT_TYPES.has(cur.type) && guard++ < 16) {
         const li = (cur.inputs || []).find((i) => i.name === "latent");
         if (!li || li.link == null) break;
         const lk = app.graph.links[li.link];
         if (!lk) break;
         cur = app.graph._nodes_by_id[lk.origin_id];
     }
-    return cur && cur.type === "MiniMaxH3ImageToVideo" ? cur : null;
+    return cur && H3_ROOT_TYPES.has(cur.type) ? cur : null;
+}
+
+// rgthree/KJNodes 的 Set/Get 虚拟节点：连接名存在第一个 widget 的值里
+function getVirtualName(n) {
+    const w = (n.widgets || [])[0];
+    return w ? String(w.value) : "";
+}
+
+function setVirtualName(n, newName) {
+    const w = (n.widgets || [])[0];
+    if (w) {
+        try { if (n.properties && "previousName" in n.properties) n.properties.previousName = w.value; } catch (e) { /* 忽略 */ }
+        w.value = newName;
+    }
+    n.title = (n.type === "GetNode" ? "Get_" : "Set_") + newName;
+}
+
+// 找"视频VAE"/"音频VAE"对应的 Get 节点：优先与 refNode 同一分组，其次全图同名
+function findNamedGetNode(graph, refNode, virtualName) {
+    let fallback = null;
+    const refGrp = refNode ? groupAtPoint(graph, refNode.pos[0] + ((refNode.size && refNode.size[0]) || 200) / 2,
+                                            refNode.pos[1] + ((refNode.size && refNode.size[1]) || 100) / 2) : null;
+    for (const n of graph._nodes) {
+        if (n.type !== "GetNode") continue;
+        if (getVirtualName(n) !== virtualName) continue;
+        if (refGrp) {
+            const b = groupBounds(refGrp);
+            if (b && n.pos && n.pos[0] >= b[0] && n.pos[0] <= b[0] + b[2] && n.pos[1] >= b[1] && n.pos[1] <= b[1] + b[3]) return n;
+        }
+        if (!fallback) fallback = n;
+    }
+    return fallback;
 }
 
 function segmentMidpoint(rootNode) {
@@ -137,7 +174,7 @@ function insertGuide(srcNode, mode) {
 
         connectByName(srcNode, 0, g, "positive");
         let latentSrc = root || srcNode;
-        let latentSlot = root && root.type === "MiniMaxH3ImageToVideo" ? 1 : 0;
+        let latentSlot = root ? 1 : 0; // I2V 与 R2V 根节点的 latent 都在 1 号输出槽
         if (srcNode.type === "MiniMaxH3ImageToVideo") { latentSrc = srcNode; latentSlot = 1; }
         connectByName(latentSrc, latentSlot, g, "latent");
 
@@ -147,13 +184,15 @@ function insertGuide(srcNode, mode) {
         const created = [];
         if (mode === "image" || mode === "both") {
             const img = makeLoader("LoadImage", graph, "参考图（请选择素材）", "image", "png");
-            const vae = findVaeloader(graph, VIDEO_VAE_HINT, VIDEO_VAE_FALLBACK);
+            // VAE 来源优先本段分组内的 Get_视频VAE（R2V 结构约定），找不到再退回 VAELoader
+            const vae = findNamedGetNode(graph, srcNode, "视频VAE") || findVaeloader(graph, VIDEO_VAE_HINT, VIDEO_VAE_FALLBACK);
             if (img && connectByName(img, 0, g, "image")) created.push(img);
             if (vae) connectByName(vae, 0, g, "vae");
         }
         if (mode === "audio" || mode === "both") {
             const aud = makeLoader("LoadAudio", graph, "参考音频（请选择素材）", "audio", "mp3");
-            const vae = findVaeloader(graph, AUDIO_VAE_HINT, AUDIO_VAE_FALLBACK);
+            // 音频 VAE 同理：优先本段分组内的 Get_音频VAE
+            const vae = findNamedGetNode(graph, srcNode, "音频VAE") || findVaeloader(graph, AUDIO_VAE_HINT, AUDIO_VAE_FALLBACK);
             if (aud && connectByName(aud, 0, g, "audio")) created.push(aud);
             if (vae) connectByName(vae, 0, g, "audio_vae");
         }
@@ -349,20 +388,26 @@ function segmentOrder(graph) {
 
 function getSegmentLength(rootNode) {
     // 长度来源三种：length 输入 ← PrimitiveInt（帧数）/ ← ComfyMathExpression（Float秒数×24 吸附 17k+5）/ widget
+    // 输入若先经过 Get→Set 虚拟节点（R2V 结构），先解析到真实来源
     const li = (rootNode.inputs || []).find((x) => x.name === "length");
     if (li && li.link != null) {
         const lk = app.graph.links[li.link];
-        const src = lk && app.graph._nodes_by_id[lk.origin_id];
+        let src = lk && app.graph._nodes_by_id[lk.origin_id];
+        if (src && src.type === "GetNode") src = followGetSource(app.graph, src);
         if (src && src.type === "ComfyMathExpression") {
             const ai = (src.inputs || []).find((x) => x.name === "values.a");
             if (ai && ai.link != null) {
                 const lk2 = app.graph.links[ai.link];
-                const fsrc = lk2 && app.graph._nodes_by_id[lk2.origin_id];
+                let fsrc = lk2 && app.graph._nodes_by_id[lk2.origin_id];
+                if (fsrc && fsrc.type === "GetNode") fsrc = followGetSource(app.graph, fsrc);
                 const fw = fsrc && getWidget(fsrc, "value");
                 const sec = parseFloat(fw && fw.value);
                 if (!isNaN(sec)) {
-                    const base = Math.max(5, Math.round(sec * 24));
-                    return base + ((5 - (base % 17)) % 17);
+                    const expr = String((getWidget(src, "expression") || {}).value || "").replace(/\s+/g, " ");
+                    const base0 = Math.max(5, Math.round(sec * 24));
+                    let base = base0 + ((5 - (base0 % 17)) % 17);
+                    if (/- ?22(?!\d)/.test(expr)) base -= RELAY_FRAMES;
+                    return base;
                 }
             }
         } else if (src) {
@@ -423,6 +468,10 @@ function createDurationChain(graph, seconds, segNo) {
 function extendVideo(clickedRoot) {
     try {
         const graph = app.graph;
+        // R2V 结构（MiniMaxH3ReferenceToVideo 段根）：走"整段克隆"逻辑
+        if (graph._nodes.some((n) => n.type === "MiniMaxH3ReferenceToVideo")) {
+            return extendVideoR2V(clickedRoot);
+        }
         const segNo = nextSegmentNumber();
         // 不管点了哪个段的按钮，都从链条末段续接（新段永远接在最后一段之后）
         const ordered = segmentOrder(graph);
@@ -631,6 +680,278 @@ function extendVideo(clickedRoot) {
     } catch (e) {
         console.error("[H3 Helper] extendVideo failed:", e);
         toast("延长视频失败：" + e.message, "error");
+    }
+}
+
+// ============ 四期：R2V 结构延长视频（整段克隆最后一段） ============
+
+// 解析 Get 节点的实际来源：同名 SetNode 的输入来源
+function followGetSource(graph, getNode) {
+    const name = getVirtualName(getNode);
+    for (const n of graph._nodes) {
+        if (n.type !== "SetNode") continue;
+        if (getVirtualName(n) !== name) continue;
+        const inp = (n.inputs || [])[0];
+        if (inp && inp.link != null) {
+            const lk = graph.links[inp.link];
+            if (lk) return graph._nodes_by_id[lk.origin_id];
+        }
+    }
+    return null;
+}
+
+// R2V 段根的实际生成帧长：length ← Get → Set → 数学表达式(秒→网格帧；表达式若带 -22 重叠扣减则一并计入)
+function r2vActualFrames(graph, root) {
+    const li = (root.inputs || []).find((x) => x.name === "length");
+    if (li && li.link != null) {
+        const lk = graph.links[li.link];
+        let src = lk && graph._nodes_by_id[lk.origin_id];
+        if (src && src.type === "GetNode") src = followGetSource(graph, src);
+        if (src && src.type === "ComfyMathExpression") {
+            const exprW = getWidget(src, "expression");
+            const expr = String((exprW && exprW.value) || "").replace(/\s+/g, " ");
+            const ai = (src.inputs || []).find((x) => x.name === "values.a");
+            if (ai && ai.link != null) {
+                const lk2 = graph.links[ai.link];
+                let f = lk2 && graph._nodes_by_id[lk2.origin_id];
+                if (f && f.type === "GetNode") f = followGetSource(graph, f);
+                const fw = f && getWidget(f, "value");
+                const sec = parseFloat(fw && fw.value);
+                if (!isNaN(sec)) {
+                    let frames = snapLength(Math.max(5, Math.round(sec * 24)));
+                    if (/- ?22(?!\d)/.test(expr)) frames -= RELAY_FRAMES;
+                    return frames;
+                }
+            }
+        }
+        if (src) {
+            const w = getWidget(src, "value");
+            const v = parseInt(w && w.value);
+            if (!isNaN(v)) return snapLength(v);
+        }
+    }
+    const lw = getWidget(root, "length");
+    return snapLength(parseInt((lw && lw.value) || 124));
+}
+
+function extendVideoR2V(clickedRoot) {
+    try {
+        const graph = app.graph;
+        // 1) 找链条末段的 R2V 段根（按 y 坐标，最下面的就是末段）
+        const roots = graph._nodes.filter((n) => n.type === "MiniMaxH3ReferenceToVideo")
+                                  .sort((a, b) => ((a.pos && a.pos[1]) || 0) - ((b.pos && b.pos[1]) || 0));
+        if (!roots.length) { toast("图中没有 MiniMaxH3ReferenceToVideo 段根", "error"); return; }
+        const rootNode = roots[roots.length - 1];
+        if (clickedRoot && clickedRoot !== rootNode) {
+            toast(`已自动改为从链条末段「${rootNode.title || rootNode.type}」续接（新段将排在最下面）`);
+        }
+
+        // 2) 定位末段所在的「视频段N」分组框（克隆范围 = 框内全部节点与子分组）
+        const rc = [rootNode.pos[0] + ((rootNode.size && rootNode.size[0]) || 200) / 2,
+                    rootNode.pos[1] + ((rootNode.size && rootNode.size[1]) || 100) / 2];
+        let segGroup = null;
+        for (const gp of graph._groups || []) {
+            const b = groupBounds(gp);
+            if (!b || b[2] < 10 || b[3] < 10) continue;
+            if (rc[0] >= b[0] && rc[0] <= b[0] + b[2] && rc[1] >= b[1] && rc[1] <= b[1] + b[3]) {
+                if (/^视频段\d+$/.test(String(gp.title || ""))) {
+                    if (!segGroup || b[2] * b[3] > groupBounds(segGroup)[2] * groupBounds(segGroup)[3]) segGroup = gp;
+                }
+            }
+        }
+        if (!segGroup) { toast("没找到末段对应的「视频段N」分组框，无法整段克隆（请检查分组标题）", "error"); return; }
+        const segNo = parseInt(String(segGroup.title).match(/^视频段(\d+)$/)[1]);
+        const newNo = segNo + 1;
+        const sb = groupBounds(segGroup);
+
+        // 3) 克隆范围：中心点落在分组框内（含 12px 容差，避免贴边节点被漏掉），
+        //    但排除中心点落在其他分组（相邻段/全局模块）内的节点
+        const MARGIN = 12;
+        const segGroupBounds = (graph._groups || [])
+            .filter((gp) => {
+                if (gp === segGroup) return false;
+                const b = groupBounds(gp);
+                if (!b || b[2] < 10 || b[3] < 10) return false;
+                // 完全落在末段分组框内的子分组不算"其他分组"
+                return !(b[0] >= sb[0] - 2 && b[1] >= sb[1] - 2 &&
+                         b[0] + b[2] <= sb[0] + sb[2] + 2 && b[1] + b[3] <= sb[1] + sb[3] + 2);
+            })
+            .map((gp) => groupBounds(gp));
+        const inSeg = (n) => {
+            if (!n.pos) return false;
+            const cx = n.pos[0] + ((n.size && n.size[0]) || 200) / 2;
+            const cy = n.pos[1] + ((n.size && n.size[1]) || 100) / 2;
+            const inside = cx >= sb[0] - MARGIN && cx <= sb[0] + sb[2] + MARGIN &&
+                           cy >= sb[1] - MARGIN && cy <= sb[1] + sb[3] + MARGIN;
+            if (!inside) return false;
+            for (const ob of segGroupBounds) {
+                if (cx >= ob[0] && cx <= ob[0] + ob[2] && cy >= ob[1] && cy <= ob[1] + ob[3]) return false;
+            }
+            return true;
+        };
+        const srcNodes = graph._nodes.filter(inSeg);
+        if (!srcNodes.length) { toast("末段分组框内没有节点", "error"); return; }
+        const srcIds = new Set(srcNodes.map((n) => String(n.id)));
+        const subGroups = (graph._groups || []).filter((gp) => {
+            if (gp === segGroup) return true;
+            const b = groupBounds(gp);
+            if (!b || b[2] < 10 || b[3] < 10) return false;
+            return b[0] >= sb[0] - 2 && b[1] >= sb[1] - 2 &&
+                   b[0] + b[2] <= sb[0] + sb[2] + 2 && b[1] + b[3] <= sb[1] + sb[3] + 2;
+        });
+
+        // 4) 改名规则：先 段N→段N+1（本段自身命名），再 段N-1→段N（接力来源引用）
+        const rename = (s) => {
+            if (s == null) return s;
+            let out = String(s).split(`段${segNo}`).join(`段${newNo}`);
+            if (segNo - 1 >= 1) out = out.split(`段${segNo - 1}`).join(`段${segNo}`);
+            return out;
+        };
+
+        // 5) 克隆节点（保留 widgets/旁路状态/排版，清空连线后重建）
+        const dy = sb[3] + 24; // 沿用既有段间距，贴在末段正下方
+        const idMap = new Map();
+        for (const src of srcNodes) {
+            const data = src.serialize();
+            delete data.id;
+            delete data.links;
+            for (const i of data.inputs || []) i.link = null;
+            for (const o of data.outputs || []) if (Array.isArray(o.links)) o.links = [];
+            const c = LiteGraph.createNode(src.type);
+            if (!c) { toast(`克隆节点失败：${src.title || src.type}（类型未注册？）`, "error"); return; }
+            c.configure(data);
+            graph.add(c);
+            c.pos = [src.pos[0], src.pos[1] + dy];
+            idMap.set(String(src.id), c);
+        }
+        const clones = srcNodes.map((s) => idMap.get(String(s.id)));
+
+        // 6) 按规则改名：标题 / Set·Get 虚拟名 / 旁路开关引用的分组 / 文件名前缀 / 便签
+        let mergeSlotName = null;
+        for (let i = 0; i < srcNodes.length; i++) {
+            const s = srcNodes[i], c = clones[i];
+            if (c.title) c.title = rename(c.title);
+            if (c.type === "GetNode" || c.type === "SetNode") setVirtualName(c, rename(getVirtualName(c)));
+            if (c.properties && typeof c.properties.matchTitle === "string") {
+                c.properties.matchTitle = rename(c.properties.matchTitle);
+            }
+            if (c.type === "SaveVideo") {
+                const w = getWidget(c, "filename_prefix") || (c.widgets || [])[0];
+                const sw = getWidget(s, "filename_prefix") || (s.widgets || [])[0];
+                if (w && sw && String(w.value) === String(sw.value)) {
+                    let p = String(w.value);
+                    if (/\d/.test(p)) {
+                        // 前缀里有数字（如 H3-Part2）→ 末尾数字 +1
+                        p = p.replace(/(\d+)(\D*)$/, (m, d, tail) => String(parseInt(d, 10) + 1) + tail);
+                    } else {
+                        p = `${p}_段${newNo}`;
+                    }
+                    w.value = p;
+                }
+            }
+            if (c.type === "MarkdownNote") {
+                const w = (c.widgets || []).find((x) => typeof x.value === "string");
+                if (w) w.value = rename(w.value);
+            }
+        }
+
+        // 7) 重建连线：按"插座名称"匹配（克隆体在 add 后槽位会被前端重排，不能按序号对位）。
+        //    段内互连 → 克隆体之间；外部共享来源 → 原节点直连克隆体；
+        //    本段对外输出 → 只自动接入 AD_video_merge 合并区的下一个空槽
+        let wired = 0;
+        const failedLinks = [];
+        const outIdxByName = (node, name) => (node.outputs || []).findIndex((o) => o.name === name);
+        const inIdxByName = (node, name) => (node.inputs || []).findIndex((i) => i.name === name);
+        for (const lk of Object.values(graph.links)) {
+            if (!lk) continue;
+            const oId = String(lk.origin_id), tId = String(lk.target_id);
+            const inO = srcIds.has(oId), inT = srcIds.has(tId);
+            if (!inO && !inT) continue;
+            const oNode = graph._nodes_by_id[lk.origin_id], tNode = graph._nodes_by_id[lk.target_id];
+            if (!oNode || !tNode) continue;
+            const oName = oNode.outputs ? (oNode.outputs[lk.origin_slot] || {}).name : null;
+            const tName = tNode.inputs ? (tNode.inputs[lk.target_slot] || {}).name : null;
+            if (oName == null || tName == null) continue;
+            if (inO && inT) {
+                const cs = idMap.get(oId), ct = idMap.get(tId);
+                const os = outIdxByName(cs, oName), tis = inIdxByName(ct, tName);
+                if (os >= 0 && tis >= 0 && cs.connect(os, ct, tis)) { wired++; continue; }
+                failedLinks.push(`克隆内: ${oNode.title || oNode.type}.${oName} → ${tNode.title || tNode.type}.${tName}`);
+            } else if (inT) {
+                const ct = idMap.get(tId);
+                const tis = inIdxByName(ct, tName);
+                if (tis >= 0 && oNode.connect(lk.origin_slot, ct, tis)) { wired++; continue; }
+                failedLinks.push(`外部接入: ${oNode.title || oNode.type}.${oName} → ${tNode.title || tNode.type}.${tName}`);
+            } else if (inO) {
+                const cs = idMap.get(oId);
+                if (tNode.type === "AD_video_merge") {
+                    const ins = tn_inputs(tNode);
+                    const freeIdx = ins.findIndex((x) => /^video\d+$/.test(x.name) && x.link == null);
+                    const os = outIdxByName(cs, oName);
+                    if (freeIdx >= 0 && os >= 0 && cs.connect(os, tNode, freeIdx)) {
+                        wired++;
+                        mergeSlotName = ins[freeIdx].name;
+                        continue;
+                    }
+                    failedLinks.push(`合并区: ${oNode.title || oNode.type}.${oName}`);
+                }
+            }
+        }
+        function tn_inputs(tn) { return tn.inputs || []; }
+
+        // 8) 接力桥与噪波：batch_index 按末段实际生成帧长重算（实际帧长已含表达式中的 -22 重叠扣减）；种子 +1
+        const snapped = r2vActualFrames(graph, rootNode);
+        for (const c of clones) {
+            if (c.type === "ImageFromBatch" && /尾部.*帧/.test(c.title || "")) {
+                const bi = getWidget(c, "batch_index");
+                if (bi) bi.value = snapped - RELAY_FRAMES;
+            }
+            if (c.type === "RandomNoise") {
+                const w = getWidget(c, "noise_seed");
+                if (w) w.value = (parseInt(w.value, 10) || 0) + 1;
+            }
+        }
+
+        // 9) 素材输入初始屏蔽（仿照段1/段2的手工惯例）：新段只保留 参考图1、参考图2 激活，
+        //    参考图3-9、参考音频、音频修剪、视频素材链（载入→切片→取组件）全部旁路；
+        //    其余节点（段根/锚点/采样链/接力桥/素材开关等）一律恢复激活，保证新段开箱即用
+        let materialOff = 0;
+        for (const c of clones) {
+            const t = String(c.title || "");
+            let bypass = false;
+            if (c.type === "LoadImage") bypass = /^参考图\d+$/.test(t) && !/^参考图[12]$/.test(t);
+            else if (c.type === "LoadAudio") bypass = true;
+            else if (c.type === "TrimAudioDuration") bypass = /^音频\d+修剪/.test(t);
+            else if (c.type === "LoadVideo" || c.type === "Video Slice" || c.type === "GetVideoComponents") bypass = true;
+            c.mode = bypass ? 4 : 0;
+            if (bypass) materialOff++;
+        }
+
+        // 10) 克隆分组框（含全部子分组），标题按同一规则改名
+        try {
+            for (const gp of subGroups) {
+                const b = groupBounds(gp);
+                if (!b) continue;
+                const grp = new LGraphGroup(rename(gp.title) || gp.title || `视频段${newNo}`);
+                const nb = [b[0], b[1] + dy, b[2], b[3]];
+                grp.bounding = nb;
+                grp._pos = [nb[0], nb[1]];
+                grp._size = [nb[2], nb[3]];
+                grp._bounding = nb.slice();
+                graph.add(grp);
+            }
+        } catch (e) { console.warn("[H3 Helper] R2V 分组克隆失败:", e); }
+
+        app.canvas.setDirty(true, true);
+        toast(`已整段克隆「${segGroup.title}」→「视频段${newNo}」（${clones.length} 个节点、${wired} 条连线）` +
+              (mergeSlotName ? `，已接入合并区 ${mergeSlotName} 槽位` : "") +
+              `。接力取段${segNo}尾部${RELAY_FRAMES}帧（batch_index=${snapped - RELAY_FRAMES}），噪波种子已 +1。` +
+              `素材已按惯例初始化：仅 参考图1/参考图2 激活，其余 ${materialOff} 个图片/音频/视频素材模块已旁路，用到哪个再取消哪个。` +
+              `新段提示词与源段相同，记得修改；` +
+              (failedLinks.length ? `【警告】有 ${failedLinks.length} 条连线未接上：${failedLinks.slice(0, 3).join("；")}${failedLinks.length > 3 ? " 等" : ""}，请手动补接。` : ""));
+    } catch (e) {
+        console.error("[H3 Helper] extendVideoR2V failed:", e);
+        toast("R2V 延长视频失败：" + e.message, "error");
     }
 }
 
@@ -945,6 +1266,7 @@ app.registerExtension({
     beforeRegisterNodeDef(nodeType, nodeData) {
         const isAnchor = H3_ANCHOR_TYPES.has(nodeData.name);
         const isRoot = nodeData.name === "MiniMaxH3ImageToVideo";
+        const isR2VRoot = nodeData.name === "MiniMaxH3ReferenceToVideo";
         if (!isAnchor) return;
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
@@ -958,9 +1280,12 @@ app.registerExtension({
                 this.addWidget("button", "✂ 删除最后一段", null, () => deleteSegment(self));
                 this.addWidget("button", "⤓ 整理排版", null, () => { layoutAll(); toast("已按 段×列 自动重排全图"); });
             }
+            if (isR2VRoot) {
+                this.addWidget("button", "＋ 延长视频（克隆本段往下接力）", null, () => extendVideo(self));
+            }
             return r;
         };
     },
 });
 
-console.log("[H3 Helper] WorkflowHelper v1.4.5 已加载（每段独立时长链）（修复：从文件加载的分组未被识别导致延长时全图重排）");
+console.log("[H3 Helper] WorkflowHelper v1.5.0 已加载（新增：R2V 结构延长视频=整段克隆最后一段；插入参考图/音频自动接本段 Get_视频VAE/Get_音频VAE）");
