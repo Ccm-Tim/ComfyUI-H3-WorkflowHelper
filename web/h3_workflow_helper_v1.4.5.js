@@ -948,6 +948,8 @@ function extendVideoR2V(clickedRoot) {
               `。接力取段${segNo}尾部${RELAY_FRAMES}帧（batch_index=${snapped - RELAY_FRAMES}），噪波种子已 +1。` +
               `素材已按惯例初始化：仅 参考图1/参考图2 激活，其余 ${materialOff} 个图片/音频/视频素材模块已旁路，用到哪个再取消哪个。` +
               `新段提示词与源段相同，记得修改；` +
+        (clones.some((c) => c.type === "VRGDG_MiniMaxH3AudioDrive") ?
+            "新段含⭐口播锁定(AudioDrive)：其音频来自「音频N修剪」，先取消该节点旁路并按前段累计秒数填好切片，否则⭐无音频可用；" : "") +
               (failedLinks.length ? `【警告】有 ${failedLinks.length} 条连线未接上：${failedLinks.slice(0, 3).join("；")}${failedLinks.length > 3 ? " 等" : ""}，请手动补接。` : ""));
     } catch (e) {
         console.error("[H3 Helper] extendVideoR2V failed:", e);
@@ -1288,4 +1290,4 @@ app.registerExtension({
     },
 });
 
-console.log("[H3 Helper] WorkflowHelper v1.5.0 已加载（新增：R2V 结构延长视频=整段克隆最后一段；插入参考图/音频自动接本段 Get_视频VAE/Get_音频VAE）");
+console.log("[H3 Helper] WorkflowHelper v1.5.1 已加载（含⭐AudioDrive双模式接力提示）（新增：R2V 结构延长视频=整段克隆最后一段；插入参考图/音频自动接本段 Get_视频VAE/Get_音频VAE）");
