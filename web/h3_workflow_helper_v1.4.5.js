@@ -764,12 +764,16 @@ function extendVideoR2V(clickedRoot) {
         const newNo = segNo + 1;
         const sb = groupBounds(segGroup);
 
+        // v1.5.2: 附属分组（⭐口播锁定/⭐音画等长-段N）随段一起克隆
+        const AUX_RE = new RegExp(`^(⭐口播锁定|⭐音画等长)-段${segNo}$`);
+        const auxGroups = (graph._groups || []).filter((gp) => AUX_RE.test(String(gp.title || "")) && groupBounds(gp));
+
         // 3) 克隆范围：中心点落在分组框内（含 12px 容差，避免贴边节点被漏掉），
         //    但排除中心点落在其他分组（相邻段/全局模块）内的节点
         const MARGIN = 12;
         const segGroupBounds = (graph._groups || [])
             .filter((gp) => {
-                if (gp === segGroup) return false;
+                if (gp === segGroup || auxGroups.includes(gp)) return false;
                 const b = groupBounds(gp);
                 if (!b || b[2] < 10 || b[3] < 10) return false;
                 // 完全落在末段分组框内的子分组不算"其他分组"
@@ -792,6 +796,18 @@ function extendVideoR2V(clickedRoot) {
         const srcNodes = graph._nodes.filter(inSeg);
         if (!srcNodes.length) { toast("末段分组框内没有节点", "error"); return; }
         const srcIds = new Set(srcNodes.map((n) => String(n.id)));
+        for (const agp of auxGroups) {
+            const ab = groupBounds(agp);
+            for (const n of graph._nodes) {
+                if (srcIds.has(String(n.id)) || !n.pos) continue;
+                const acx = n.pos[0] + ((n.size && n.size[0]) || 200) / 2;
+                const acy = n.pos[1] + ((n.size && n.size[1]) || 100) / 2;
+                if (acx >= ab[0] && acx <= ab[0] + ab[2] && acy >= ab[1] && acy <= ab[1] + ab[3]) {
+                    srcNodes.push(n);
+                    srcIds.add(String(n.id));
+                }
+            }
+        }
         const subGroups = (graph._groups || []).filter((gp) => {
             if (gp === segGroup) return true;
             const b = groupBounds(gp);
@@ -799,6 +815,7 @@ function extendVideoR2V(clickedRoot) {
             return b[0] >= sb[0] - 2 && b[1] >= sb[1] - 2 &&
                    b[0] + b[2] <= sb[0] + sb[2] + 2 && b[1] + b[3] <= sb[1] + sb[3] + 2;
         });
+        for (const agp of auxGroups) if (!subGroups.includes(agp)) subGroups.push(agp);
 
         // 4) 改名规则：先 段N→段N+1（本段自身命名），再 段N-1→段N（接力来源引用）
         const rename = (s) => {
@@ -1290,4 +1307,4 @@ app.registerExtension({
     },
 });
 
-console.log("[H3 Helper] WorkflowHelper v1.5.1 已加载（含⭐AudioDrive双模式接力提示）（新增：R2V 结构延长视频=整段克隆最后一段；插入参考图/音频自动接本段 Get_视频VAE/Get_音频VAE）");
+console.log("[H3 Helper] WorkflowHelper v1.5.2 已加载（延长视频现连同 ⭐口播锁定/⭐音画等长-段N 附属分组一起克隆）（含⭐AudioDrive双模式接力提示）（新增：R2V 结构延长视频=整段克隆最后一段；插入参考图/音频自动接本段 Get_视频VAE/Get_音频VAE）");
