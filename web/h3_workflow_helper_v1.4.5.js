@@ -11,7 +11,7 @@
 // 删除本插件后，工作流仍是 100% 官方节点链。
 
 import { app } from "../../scripts/app.js";
-window.__H3_HELPER_VERSION = "1.5.0";
+window.__H3_HELPER_VERSION = "1.6.3";
 
 const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide", "MiniMaxH3ReferenceToVideo"]);
 const H3_ROOT_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo"]);
@@ -765,8 +765,23 @@ function extendVideoR2V(clickedRoot) {
         const sb = groupBounds(segGroup);
 
         // v1.5.2: 附属分组（⭐口播锁定/⭐音画等长-段N）随段一起克隆
+        // v1.6.0: 附属分组泛化——带内附属组（口播锁定等）跟随主段位移；
+        //         带外附属组（段N视频与抽卡视频切换）按自身位置独立堆叠到正下方
         const AUX_RE = new RegExp(`^(⭐口播锁定|⭐音画等长)-段${segNo}$`);
-        const auxGroups = (graph._groups || []).filter((gp) => AUX_RE.test(String(gp.title || "")) && groupBounds(gp));
+        const SWITCH_RE = new RegExp(`^段${segNo}视频与抽卡视频切换$`);
+        const auxGroups = [];
+        const auxEntries = [];
+        for (const gp of graph._groups || []) {
+            const t = String(gp.title || "");
+            const b = groupBounds(gp);
+            if (!b || b[2] < 10 || b[3] < 10) continue;
+            if (!AUX_RE.test(t) && !SWITCH_RE.test(t)) continue;
+            const inBand = b[0] >= sb[0] - 2 && b[1] >= sb[1] - 2 &&
+                           b[0] + b[2] <= sb[0] + sb[2] + 2 && b[1] + b[3] <= sb[1] + sb[3] + 2;
+            auxGroups.push(gp);
+            auxEntries.push({ gp, b, title: t, inBand, dy: inBand ? (sb[3] + 24) : (b[3] + 24) });
+        }
+        const switchEntry = auxEntries.find((e) => SWITCH_RE.test(e.title)) || null;
 
         // 3) 克隆范围：中心点落在分组框内（含 12px 容差，避免贴边节点被漏掉），
         //    但排除中心点落在其他分组（相邻段/全局模块）内的节点
@@ -796,26 +811,75 @@ function extendVideoR2V(clickedRoot) {
         const srcNodes = graph._nodes.filter(inSeg);
         if (!srcNodes.length) { toast("末段分组框内没有节点", "error"); return; }
         const srcIds = new Set(srcNodes.map((n) => String(n.id)));
-        for (const agp of auxGroups) {
-            const ab = groupBounds(agp);
+        // 克隆任务表：主段带节点用主段位移；附属分组节点用各自分组的位移
+        const dy = sb[3] + 24; // 沿用既有段间距，贴在末段正下方
+        const cloneJobs = srcNodes.map((n) => ({ src: n, dy }));
+        for (const e of auxEntries) {
+            const ab = e.b;
+            if (SWITCH_RE.test(e.title)) continue; // 切换组走下方结构化收编，不做几何收集
             for (const n of graph._nodes) {
                 if (srcIds.has(String(n.id)) || !n.pos) continue;
+                // 切换组贴边防护：明确属于其他段的 Set（段X图像/音频，X≠本段）不收编
+                if (SWITCH_RE.test(e.title) && (n.type === "SetNode" || n.type === "GetNode")) {
+                    const vn = getVirtualName(n);
+                    const om = String(vn).match(/^段(\d+)(?:图像|音频)$/);
+                    if (om && parseInt(om[1], 10) !== segNo) continue;
+                }
                 const acx = n.pos[0] + ((n.size && n.size[0]) || 200) / 2;
                 const acy = n.pos[1] + ((n.size && n.size[1]) || 100) / 2;
-                if (acx >= ab[0] && acx <= ab[0] + ab[2] && acy >= ab[1] && acy <= ab[1] + ab[3]) {
-                    srcNodes.push(n);
+                if (acx >= ab[0] - MARGIN && acx <= ab[0] + ab[2] + MARGIN &&
+                    acy >= ab[1] - MARGIN && acy <= ab[1] + ab[3] + MARGIN) {
+                    cloneJobs.push({ src: n, dy: e.dy });
                     srcIds.add(String(n.id));
+                }
+            }
+        }
+        // 切换组（段N视频与抽卡视频切换）：纯结构化收编——按虚拟名找到 Set_段N图像/音频，
+        // 沿连线向上追踪其切换节点与 Get_抽卡 来源，不做几何判定（避免组框边缘浮点误差漏节点）
+        if (switchEntry) {
+            for (const nm of [`段${segNo}图像`, `段${segNo}音频`]) {
+                const sn = graph._nodes.find((x) => x.type === "SetNode" && getVirtualName(x) === nm);
+                if (!sn || srcIds.has(String(sn.id))) continue;
+                cloneJobs.push({ src: sn, dy: switchEntry.dy });
+                srcIds.add(String(sn.id));
+                const sinp = (sn.inputs || [])[0];
+                if (sinp && sinp.link != null) {
+                    const slk = graph.links[sinp.link];
+                    const swn = slk && graph._nodes_by_id[slk.origin_id];
+                    if (swn && swn.type === "Any Switch (rgthree)" && !srcIds.has(String(swn.id))) {
+                        cloneJobs.push({ src: swn, dy: switchEntry.dy });
+                        srcIds.add(String(swn.id));
+                    }
+                }
+            }
+            // 切换节点的 Get_抽卡 来源（虚拟名带"抽卡"的 GetNode）
+            for (const n of graph._nodes) {
+                if (srcIds.has(String(n.id)) || n.type !== "GetNode") continue;
+                const vn = getVirtualName(n);
+                if (!/抽卡/.test(vn)) continue;
+                for (const job of cloneJobs) {
+                    if (job.src.type !== "Any Switch (rgthree)" || !srcIds.has(String(job.src.id))) continue;
+                    const isSrc = (job.src.inputs || []).some((i) => {
+                        if (i.link == null) return false;
+                        const l2 = graph.links[i.link];
+                        return l2 && String(l2.origin_id) === String(n.id);
+                    });
+                    if (isSrc) {
+                        cloneJobs.push({ src: n, dy: switchEntry.dy });
+                        srcIds.add(String(n.id));
+                        break;
+                    }
                 }
             }
         }
         const subGroups = (graph._groups || []).filter((gp) => {
             if (gp === segGroup) return true;
+            if (auxGroups.includes(gp)) return false; // 附属分组单独处理（各自位移）
             const b = groupBounds(gp);
             if (!b || b[2] < 10 || b[3] < 10) return false;
             return b[0] >= sb[0] - 2 && b[1] >= sb[1] - 2 &&
                    b[0] + b[2] <= sb[0] + sb[2] + 2 && b[1] + b[3] <= sb[1] + sb[3] + 2;
         });
-        for (const agp of auxGroups) if (!subGroups.includes(agp)) subGroups.push(agp);
 
         // 4) 改名规则：先 段N→段N+1（本段自身命名），再 段N-1→段N（接力来源引用）
         const rename = (s) => {
@@ -825,10 +889,10 @@ function extendVideoR2V(clickedRoot) {
             return out;
         };
 
-        // 5) 克隆节点（保留 widgets/旁路状态/排版，清空连线后重建）
-        const dy = sb[3] + 24; // 沿用既有段间距，贴在末段正下方
+        // 5) 克隆节点（保留 widgets/旁路状态/排版，清空连线后重建；按各自分组的位移摆放）
         const idMap = new Map();
-        for (const src of srcNodes) {
+        for (const job of cloneJobs) {
+            const src = job.src;
             const data = src.serialize();
             delete data.id;
             delete data.links;
@@ -838,15 +902,16 @@ function extendVideoR2V(clickedRoot) {
             if (!c) { toast(`克隆节点失败：${src.title || src.type}（类型未注册？）`, "error"); return; }
             c.configure(data);
             graph.add(c);
-            c.pos = [src.pos[0], src.pos[1] + dy];
+            c.pos = [src.pos[0], src.pos[1] + job.dy];
             idMap.set(String(src.id), c);
         }
-        const clones = srcNodes.map((s) => idMap.get(String(s.id)));
+        const clones = cloneJobs.map((j) => idMap.get(String(j.src.id)));
+        const allSrc = cloneJobs.map((j) => j.src);
 
         // 6) 按规则改名：标题 / Set·Get 虚拟名 / 旁路开关引用的分组 / 文件名前缀 / 便签
         let mergeSlotName = null;
-        for (let i = 0; i < srcNodes.length; i++) {
-            const s = srcNodes[i], c = clones[i];
+        for (let i = 0; i < cloneJobs.length; i++) {
+            const s = allSrc[i], c = clones[i];
             if (c.title) c.title = rename(c.title);
             if (c.type === "GetNode" || c.type === "SetNode") setVirtualName(c, rename(getVirtualName(c)));
             if (c.properties && typeof c.properties.matchTitle === "string") {
@@ -944,24 +1009,31 @@ function extendVideoR2V(clickedRoot) {
             if (bypass) materialOff++;
         }
 
-        // 10) 克隆分组框（含全部子分组），标题按同一规则改名
+        // 10) 克隆分组框（含全部子分组），标题按同一规则改名；附属分组按各自位移独立摆放
         try {
-            for (const gp of subGroups) {
-                const b = groupBounds(gp);
-                if (!b) continue;
+            const cloneGroupAt = (gp, b, offDy) => {
                 const grp = new LGraphGroup(rename(gp.title) || gp.title || `视频段${newNo}`);
-                const nb = [b[0], b[1] + dy, b[2], b[3]];
+                const nb = [b[0], b[1] + offDy, b[2], b[3]];
                 grp.bounding = nb;
                 grp._pos = [nb[0], nb[1]];
                 grp._size = [nb[2], nb[3]];
                 grp._bounding = nb.slice();
                 graph.add(grp);
+            };
+            for (const gp of subGroups) {
+                const b = groupBounds(gp);
+                if (!b) continue;
+                cloneGroupAt(gp, b, dy);
+            }
+            for (const e of auxEntries) {
+                cloneGroupAt(e.gp, e.b, e.dy);
             }
         } catch (e) { console.warn("[H3 Helper] R2V 分组克隆失败:", e); }
 
         app.canvas.setDirty(true, true);
         toast(`已整段克隆「${segGroup.title}」→「视频段${newNo}」（${clones.length} 个节点、${wired} 条连线）` +
               (mergeSlotName ? `，已接入合并区 ${mergeSlotName} 槽位` : "") +
+              (switchEntry ? `，切换组已更新为「段${newNo}视频与抽卡视频切换」（排在上一段切换组正下方）` : "") +
               `。接力取段${segNo}尾部${RELAY_FRAMES}帧（batch_index=${snapped - RELAY_FRAMES}），噪波种子已 +1。` +
               `素材已按惯例初始化：仅 参考图1/参考图2 激活，其余 ${materialOff} 个图片/音频/视频素材模块已旁路，用到哪个再取消哪个。` +
               `新段提示词与源段相同，记得修改；` +
@@ -1307,4 +1379,4 @@ app.registerExtension({
     },
 });
 
-console.log("[H3 Helper] WorkflowHelper v1.5.2 已加载（延长视频现连同 ⭐口播锁定/⭐音画等长-段N 附属分组一起克隆）（含⭐AudioDrive双模式接力提示）（新增：R2V 结构延长视频=整段克隆最后一段；插入参考图/音频自动接本段 Get_视频VAE/Get_音频VAE）");
+console.log("[H3 Helper] WorkflowHelper v1.6.0 已加载（延长视频：附属分组泛化——带内附属组随主段位移，「段N视频与抽卡视频切换」组独立堆叠到上一段切换组正下方，组外 Set 节点按名收编）");
