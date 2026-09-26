@@ -11,7 +11,7 @@
 // 删除本插件后，工作流仍是 100% 官方节点链。
 
 import { app } from "../../scripts/app.js";
-window.__H3_HELPER_VERSION = "1.7.0";
+window.__H3_HELPER_VERSION = "1.8.1";
 
 const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide", "MiniMaxH3ReferenceToVideo"]);
 const H3_ROOT_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo"]);
@@ -1018,6 +1018,124 @@ function extendVideoR2V(clickedRoot) {
     }
 }
 
+// ============ 五期：R2V 删除最后一段（含「段N视频与抽卡视频切换」组） ============
+// 删除范围与克隆范围同一套规则，保证"删得干净、删后重延长不重叠不残留"。
+// 两步确认：第一次点击仅预警，15 秒内再点一次才真正删除。
+
+let r2vDelPending = null;
+
+function deleteR2VLastSegment(clickedRoot) {
+    try {
+        const graph = app.graph;
+        const roots = graph._nodes.filter((n) => n.type === "MiniMaxH3ReferenceToVideo")
+                                  .sort((a, b) => ((a.pos && a.pos[1]) || 0) - ((b.pos && b.pos[1]) || 0));
+        if (roots.length <= 1) { toast("至少要保留一个视频段（全删掉就没有段了）", "warn"); return; }
+        const rootNode = roots[roots.length - 1];
+
+        // 定位末段所在的「视频段N」分组
+        const rc = [rootNode.pos[0] + ((rootNode.size && rootNode.size[0]) || 200) / 2,
+                    rootNode.pos[1] + ((rootNode.size && rootNode.size[1]) || 100) / 2];
+        let segGroup = null;
+        for (const gp of graph._groups || []) {
+            const b = groupBounds(gp);
+            if (!b || b[2] < 10 || b[3] < 10) continue;
+            if (rc[0] >= b[0] && rc[0] <= b[0] + b[2] && rc[1] >= b[1] && rc[1] <= b[1] + b[3] &&
+                /^视频段\d+$/.test(String(gp.title || ""))) {
+                if (!segGroup || b[2] * b[3] > groupBounds(segGroup)[2] * groupBounds(segGroup)[3]) segGroup = gp;
+            }
+        }
+        if (!segGroup) { toast("没找到末段对应的「视频段N」分组框，无法整段删除", "error"); return; }
+        const segNo = parseInt(String(segGroup.title).match(/^视频段(\d+)$/)[1]);
+        const sb = groupBounds(segGroup);
+        const SWITCH_RE = new RegExp(`^段${segNo}视频与抽卡视频切换$`);
+
+        // 收集删除范围：主段带（中心在框内±12，排除其他非子分组内的节点）+ 切换组（精确框内）+ 按名的 Set
+        const MARGIN = 12;
+        const groupCenterInSb = (b) => {
+            const gcx = b[0] + b[2] / 2, gcy = b[1] + b[3] / 2;
+            return gcx >= sb[0] && gcx <= sb[0] + sb[2] && gcy >= sb[1] && gcy <= sb[1] + sb[3];
+        };
+        const otherGroups = (graph._groups || []).filter((gp) => {
+            if (gp === segGroup || SWITCH_RE.test(String(gp.title || ""))) return false;
+            const b = groupBounds(gp);
+            if (!b || b[2] < 10 || b[3] < 10) return false;
+            return !groupCenterInSb(b);
+        });
+        const delNodes = graph._nodes.filter((n) => {
+            if (!n.pos) return false;
+            const cx = n.pos[0] + ((n.size && n.size[0]) || 200) / 2;
+            const cy = n.pos[1] + ((n.size && n.size[1]) || 100) / 2;
+            const inside = cx >= sb[0] - MARGIN && cx <= sb[0] + sb[2] + MARGIN &&
+                           cy >= sb[1] - MARGIN && cy <= sb[1] + sb[3] + MARGIN;
+            if (!inside) return false;
+            for (const og of otherGroups) {
+                const b = groupBounds(og);
+                if (cx >= b[0] && cx <= b[0] + b[2] && cy >= b[1] && cy <= b[1] + b[3]) return false;
+            }
+            return true;
+        });
+        const swGroup = (graph._groups || []).find((gp) => SWITCH_RE.test(String(gp.title || "")) && groupBounds(gp));
+        if (swGroup) {
+            const b = groupBounds(swGroup);
+            for (const n of graph._nodes) {
+                const cx = n.pos[0] + ((n.size && n.size[0]) || 200) / 2;
+                const cy = n.pos[1] + ((n.size && n.size[1]) || 100) / 2;
+                if (cx >= b[0] && cx <= b[0] + b[2] && cy >= b[1] && cy <= b[1] + b[3] && !delNodes.includes(n)) delNodes.push(n);
+            }
+        }
+        for (const nm of [`段${segNo}图像`, `段${segNo}音频`]) {
+            const sn = graph._nodes.find((x) => x.type === "SetNode" && getVirtualName(x) === nm);
+            if (sn && !delNodes.includes(sn)) delNodes.push(sn);
+        }
+        if (!delNodes.length) { toast("末段分组框内没有可删除的节点", "error"); return; }
+
+        // 两步确认：第一次点击仅预警，15 秒内再点一次才真正删除
+        const key = `视频段${segNo}`;
+        const now = Date.now();
+        if (!r2vDelPending || r2vDelPending.key !== key || now - r2vDelPending.at > 15000) {
+            r2vDelPending = { key, at: now };
+            toast(`⚠ 准备删除末段「视频段${segNo}」及其切换组：共 ${delNodes.length} 个节点。确认后【再点一次】此按钮执行删除（15 秒内有效）。`, "warn");
+            return;
+        }
+        r2vDelPending = null;
+
+        let removed = 0;
+        for (const n of delNodes) {
+            try { graph.remove(n); removed++; } catch (e) { console.warn("[H3 Helper] 删除节点失败:", n.title || n.type, e); }
+        }
+        // 删除分组框：主段组 + 其子分组 + 切换组
+        let groupsRemoved = 0;
+        try {
+            const delGroups = (graph._groups || []).filter((gp) => {
+                if (gp === segGroup || SWITCH_RE.test(String(gp.title || ""))) return true;
+                const b = groupBounds(gp);
+                return b && groupCenterInSb(b);
+            });
+            for (const gp of delGroups) {
+                const i = graph._groups.indexOf(gp);
+                if (i >= 0) { graph._groups.splice(i, 1); groupsRemoved++; }
+            }
+        } catch (e) { console.warn("[H3 Helper] 分组删除失败:", e); }
+
+        // 残留扫描：删除后全图搜一遍仍带「段N」字样的节点/分组，防止手动残局导致后续延长重叠
+        const leftovers = [];
+        for (const n of graph._nodes) {
+            const t = String(n.title || "");
+            const vn = (n.type === "GetNode" || n.type === "SetNode") ? getVirtualName(n) : "";
+            if (t.includes(`段${segNo}`) || vn.includes(`段${segNo}`)) leftovers.push((n.title || n.type) + " #" + n.id);
+        }
+        const leftoverGroups = (graph._groups || []).filter((gp) => String(gp.title || "").includes(`段${segNo}`)).map((gp) => gp.title);
+
+        app.canvas.setDirty(true, true);
+        toast(`已删除末段「视频段${segNo}」及其切换组（${removed} 个节点、${groupsRemoved} 个分组框）。当前末段为「视频段${segNo - 1}」，合并区对应槽位已空出，可直接重新延长。` +
+              (leftovers.length ? `【注意】图内仍残留 ${leftovers.length} 个带「段${segNo}」字样的节点：${leftovers.slice(0, 3).join("、")}${leftovers.length > 3 ? " 等" : ""}，多为组框外的散落节点，请手动检查删除。` : "") +
+              (leftoverGroups.length ? `另有 ${leftoverGroups.length} 个空分组框残留（${leftoverGroups.slice(0, 3).join("、")}），可手动删除。` : ""));
+    } catch (e) {
+        console.error("[H3 Helper] deleteR2VLastSegment failed:", e);
+        toast("删除最后一段失败：" + e.message, "error");
+    }
+}
+
 // ============ GROUP 尊重模式 ============
 // 图里存在 GROUP（分组框）视为"用户手工布局"：插件不重排用户分组的段；
 // 新增段整体放在最下部分组正下方；整理排版只整理未被分组的段。
@@ -1345,6 +1463,7 @@ app.registerExtension({
             }
             if (isR2VRoot) {
                 this.addWidget("button", "＋ 延长视频（克隆本段往下接力）", null, () => extendVideo(self));
+                this.addWidget("button", "✂ 删除最后一段（含切换组）", null, () => deleteR2VLastSegment(self));
             }
             return r;
         };
