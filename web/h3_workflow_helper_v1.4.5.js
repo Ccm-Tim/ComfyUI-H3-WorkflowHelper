@@ -11,7 +11,7 @@
 // 删除本插件后，工作流仍是 100% 官方节点链。
 
 import { app } from "../../scripts/app.js";
-window.__H3_HELPER_VERSION = "1.8.1";
+window.__H3_HELPER_VERSION = "1.9.0";
 
 const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide", "MiniMaxH3ReferenceToVideo"]);
 const H3_ROOT_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo"]);
@@ -1002,10 +1002,47 @@ function extendVideoR2V(clickedRoot) {
             }
         } catch (e) { console.warn("[H3 Helper] R2V 分组克隆失败:", e); }
 
+        // 11) 全局段开关（Fast Groups Muter/Bypasser）自动同步：
+        //     「# 选择要生成的视频段」等全局开关节点不在克隆范围内，其 matchTitle 枚举了
+        //     视频段X 条目，新段克隆后需补齐缺失的段条目并刷新，否则新段的开关不会出现
+        let selectorSynced = false;
+        try {
+            const groupTitles = new Set((graph._groups || []).map((gp) => String(gp.title || "")).filter(Boolean));
+            for (const n of graph._nodes) {
+                if (srcIds.has(String(n.id))) continue; // 克隆体内的开关已由改名规则处理
+                if (n.type !== "Fast Groups Muter (rgthree)" && n.type !== "Fast Groups Bypasser (rgthree)") continue;
+                const p = n.properties;
+                if (!p || typeof p.matchTitle !== "string" || !p.matchTitle.trim()) continue;
+                const entries = p.matchTitle.split("|").map((s) => s.trim()).filter(Boolean);
+                if (!entries.some((e) => /段\d+$/.test(e))) continue; // 只处理枚举了"段N"条目的开关
+                let changed = false;
+                const addIfGroupExists = (name) => {
+                    if (name && groupTitles.has(name) && !entries.includes(name)) { entries.push(name); changed = true; }
+                };
+                // 1) 本段条目顺延：段N → 段N+1
+                for (const e of entries.slice()) {
+                    const m = e.match(/^(.*-?段)(\d+)$/);
+                    if (m && parseInt(m[2], 10) === segNo) addIfGroupExists(m[1] + newNo);
+                }
+                // 2) 补齐历史缺失的段条目（组存在才补，顺序 1..newNo）
+                for (let x = 1; x <= newNo; x++) {
+                    for (const e of entries.slice()) {
+                        const m = e.match(/^(.*-?段)(\d+)$/);
+                        if (m && parseInt(m[2], 10) !== x) addIfGroupExists(m[1] + x);
+                    }
+                }
+                if (!changed) continue;
+                p.matchTitle = entries.join("|");
+                if (typeof n.refreshWidgets === "function") { try { n.refreshWidgets(); } catch (e2) { /* 忽略 */ } }
+                selectorSynced = true;
+            }
+        } catch (e) { console.warn("[H3 Helper] 全局段开关同步失败:", e); }
+
         app.canvas.setDirty(true, true);
         toast(`已整段克隆「${segGroup.title}」→「视频段${newNo}」（${clones.length} 个节点、${wired} 条连线）` +
               (mergeSlotName ? `，已接入合并区 ${mergeSlotName} 槽位` : "") +
               (switchEntry ? `，切换组已更新为「段${newNo}视频与抽卡视频切换」（排在上一段切换组正下方）` : "") +
+              (selectorSynced ? `，「# 选择要生成的视频段」等全局开关已自动补入新段条目` : "") +
               `。接力取段${segNo}尾部${RELAY_FRAMES}帧（batch_index=-22，从结尾倒数），噪波种子已 +1。` +
               `素材已按惯例初始化：仅 参考图1/参考图2 激活，其余 ${materialOff} 个图片/音频/视频素材模块已旁路，用到哪个再取消哪个。` +
               `新段提示词与源段相同，记得修改；` +
@@ -1116,6 +1153,20 @@ function deleteR2VLastSegment(clickedRoot) {
                 if (i >= 0) { graph._groups.splice(i, 1); groupsRemoved++; }
             }
         } catch (e) { console.warn("[H3 Helper] 分组删除失败:", e); }
+
+        // 同步全局段开关：移除指向已删分组的「视频段N」「⭐XX-段N」条目并刷新
+        try {
+            for (const n of graph._nodes) {
+                if (n.type !== "Fast Groups Muter (rgthree)" && n.type !== "Fast Groups Bypasser (rgthree)") continue;
+                const p = n.properties;
+                if (!p || typeof p.matchTitle !== "string" || !p.matchTitle.trim()) continue;
+                const entries = p.matchTitle.split("|").map((s) => s.trim()).filter(Boolean);
+                const kept = entries.filter((e) => !(new RegExp(`段${segNo}$`)).test(e));
+                if (kept.length === entries.length) continue;
+                p.matchTitle = kept.join("|");
+                if (typeof n.refreshWidgets === "function") { try { n.refreshWidgets(); } catch (e2) { /* 忽略 */ } }
+            }
+        } catch (e) { console.warn("[H3 Helper] 全局段开关同步失败:", e); }
 
         // 残留扫描：删除后全图搜一遍仍带「段N」字样的节点/分组，防止手动残局导致后续延长重叠
         const leftovers = [];
