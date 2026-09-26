@@ -11,7 +11,7 @@
 // 删除本插件后，工作流仍是 100% 官方节点链。
 
 import { app } from "../../scripts/app.js";
-window.__H3_HELPER_VERSION = "1.6.5";
+window.__H3_HELPER_VERSION = "1.7.0";
 
 const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide", "MiniMaxH3ReferenceToVideo"]);
 const H3_ROOT_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo"]);
@@ -546,7 +546,7 @@ function extendVideo(clickedRoot) {
         graph.add(bridgeImg);
         bridgeImg.title = `段${segNo - 1}尾部${RELAY_FRAMES}帧（接力用）`;
         const bi = getWidget(bridgeImg, "batch_index");
-        if (bi) bi.value = snapped - RELAY_FRAMES;
+        if (bi) bi.value = -RELAY_FRAMES; // 负索引=从结尾倒数，段长变化自动适配
         const bl = getWidget(bridgeImg, "length");
         if (bl) bl.value = RELAY_FRAMES;
         connectByName(oldVDecode, 0, bridgeImg, "image");
@@ -674,7 +674,7 @@ function extendVideo(clickedRoot) {
             }
         } catch (e) { console.warn("[H3 Helper] 分组框创建失败:", e); }
 
-        toast(`已追加段${segNo}（已自动框为「视频段${segNo}」分组）。接力桥取段${segNo - 1}尾部${RELAY_FRAMES}帧（batch_index=${snapped - RELAY_FRAMES}）。语音与尾帧素材请自行选择。`);
+        toast(`已追加段${segNo}（已自动框为「视频段${segNo}」分组）。接力桥取段${segNo - 1}尾部${RELAY_FRAMES}帧（batch_index=-22，从结尾倒数）。语音与尾帧素材请自行选择。`);
 
         app.canvas.setDirty(true, true);
     } catch (e) {
@@ -701,39 +701,6 @@ function followGetSource(graph, getNode) {
 }
 
 // R2V 段根的实际生成帧长：length ← Get → Set → 数学表达式(秒→网格帧；表达式若带 -22 重叠扣减则一并计入)
-function r2vActualFrames(graph, root) {
-    const li = (root.inputs || []).find((x) => x.name === "length");
-    if (li && li.link != null) {
-        const lk = graph.links[li.link];
-        let src = lk && graph._nodes_by_id[lk.origin_id];
-        if (src && src.type === "GetNode") src = followGetSource(graph, src);
-        if (src && src.type === "ComfyMathExpression") {
-            const exprW = getWidget(src, "expression");
-            const expr = String((exprW && exprW.value) || "").replace(/\s+/g, " ");
-            const ai = (src.inputs || []).find((x) => x.name === "values.a");
-            if (ai && ai.link != null) {
-                const lk2 = graph.links[ai.link];
-                let f = lk2 && graph._nodes_by_id[lk2.origin_id];
-                if (f && f.type === "GetNode") f = followGetSource(graph, f);
-                const fw = f && getWidget(f, "value");
-                const sec = parseFloat(fw && fw.value);
-                if (!isNaN(sec)) {
-                    let frames = snapLength(Math.max(5, Math.round(sec * 24)));
-                    if (/- ?22(?!\d)/.test(expr)) frames -= RELAY_FRAMES;
-                    return frames;
-                }
-            }
-        }
-        if (src) {
-            const w = getWidget(src, "value");
-            const v = parseInt(w && w.value);
-            if (!isNaN(v)) return snapLength(v);
-        }
-    }
-    const lw = getWidget(root, "length");
-    return snapLength(parseInt((lw && lw.value) || 124));
-}
-
 function extendVideoR2V(clickedRoot) {
     try {
         const graph = app.graph;
@@ -986,12 +953,12 @@ function extendVideoR2V(clickedRoot) {
         }
         function tn_inputs(tn) { return tn.inputs || []; }
 
-        // 8) 接力桥与噪波：batch_index 按末段实际生成帧长重算（实际帧长已含表达式中的 -22 重叠扣减）；种子 +1
-        const snapped = r2vActualFrames(graph, rootNode);
+        // 8) 接力桥与噪波：batch_index 用 -22（内核 ImageFromBatch 支持负索引=从结尾倒数），
+        //    无论上一段实际帧长多少都精确指向尾部 22 帧，段长后续调整也不会失效；种子 +1
         for (const c of clones) {
             if (c.type === "ImageFromBatch" && /尾部.*帧/.test(c.title || "")) {
                 const bi = getWidget(c, "batch_index");
-                if (bi) bi.value = snapped - RELAY_FRAMES;
+                if (bi) bi.value = -RELAY_FRAMES;
             }
             if (c.type === "RandomNoise") {
                 const w = getWidget(c, "noise_seed");
@@ -1039,7 +1006,7 @@ function extendVideoR2V(clickedRoot) {
         toast(`已整段克隆「${segGroup.title}」→「视频段${newNo}」（${clones.length} 个节点、${wired} 条连线）` +
               (mergeSlotName ? `，已接入合并区 ${mergeSlotName} 槽位` : "") +
               (switchEntry ? `，切换组已更新为「段${newNo}视频与抽卡视频切换」（排在上一段切换组正下方）` : "") +
-              `。接力取段${segNo}尾部${RELAY_FRAMES}帧（batch_index=${snapped - RELAY_FRAMES}），噪波种子已 +1。` +
+              `。接力取段${segNo}尾部${RELAY_FRAMES}帧（batch_index=-22，从结尾倒数），噪波种子已 +1。` +
               `素材已按惯例初始化：仅 参考图1/参考图2 激活，其余 ${materialOff} 个图片/音频/视频素材模块已旁路，用到哪个再取消哪个。` +
               `新段提示词与源段相同，记得修改；` +
         (clones.some((c) => c.type === "VRGDG_MiniMaxH3AudioDrive") ?
