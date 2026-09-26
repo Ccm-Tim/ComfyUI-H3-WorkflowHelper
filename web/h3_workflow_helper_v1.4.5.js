@@ -11,7 +11,7 @@
 // 删除本插件后，工作流仍是 100% 官方节点链。
 
 import { app } from "../../scripts/app.js";
-window.__H3_HELPER_VERSION = "1.6.3";
+window.__H3_HELPER_VERSION = "1.6.5";
 
 const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide", "MiniMaxH3ReferenceToVideo"]);
 const H3_ROOT_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo"]);
@@ -786,14 +786,20 @@ function extendVideoR2V(clickedRoot) {
         // 3) 克隆范围：中心点落在分组框内（含 12px 容差，避免贴边节点被漏掉），
         //    但排除中心点落在其他分组（相邻段/全局模块）内的节点
         const MARGIN = 12;
+        // v1.6.4: 子分组判定改为"分组中心点落在主段带内"——用户手拖的组框边缘常有
+        // 几像素出界（如 首尾+中间帧处理区域 底边超出 3px），完全包含判定会把整个
+        // 子分组误判为"其他分组"，导致其罩住的十几个节点全部漏克隆
+        const groupCenterIn = (b) => {
+            const gcx = b[0] + b[2] / 2, gcy = b[1] + b[3] / 2;
+            return gcx >= sb[0] && gcx <= sb[0] + sb[2] && gcy >= sb[1] && gcy <= sb[1] + sb[3];
+        };
         const segGroupBounds = (graph._groups || [])
             .filter((gp) => {
                 if (gp === segGroup || auxGroups.includes(gp)) return false;
                 const b = groupBounds(gp);
                 if (!b || b[2] < 10 || b[3] < 10) return false;
-                // 完全落在末段分组框内的子分组不算"其他分组"
-                return !(b[0] >= sb[0] - 2 && b[1] >= sb[1] - 2 &&
-                         b[0] + b[2] <= sb[0] + sb[2] + 2 && b[1] + b[3] <= sb[1] + sb[3] + 2);
+                // 中心点在末段分组框内的子分组不算"其他分组"
+                return !groupCenterIn(b);
             })
             .map((gp) => groupBounds(gp));
         const inSeg = (n) => {
@@ -877,8 +883,7 @@ function extendVideoR2V(clickedRoot) {
             if (auxGroups.includes(gp)) return false; // 附属分组单独处理（各自位移）
             const b = groupBounds(gp);
             if (!b || b[2] < 10 || b[3] < 10) return false;
-            return b[0] >= sb[0] - 2 && b[1] >= sb[1] - 2 &&
-                   b[0] + b[2] <= sb[0] + sb[2] + 2 && b[1] + b[3] <= sb[1] + sb[3] + 2;
+            return groupCenterIn(b); // 中心点在主段带内即视为子分组（容许组框边缘出界）
         });
 
         // 4) 改名规则：先 段N→段N+1（本段自身命名），再 段N-1→段N（接力来源引用）
