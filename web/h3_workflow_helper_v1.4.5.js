@@ -11,7 +11,7 @@
 // 删除本插件后，工作流仍是 100% 官方节点链。
 
 import { app } from "../../scripts/app.js";
-window.__H3_HELPER_VERSION = "2.0.0";
+window.__H3_HELPER_VERSION = "2.1.0";
 
 const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide", "MiniMaxH3ReferenceToVideo"]);
 const H3_ROOT_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo"]);
@@ -1524,8 +1524,10 @@ function traceMaterialChain(graph, srcNode, kind) {
     if (!lk) return { error: "连线数据异常，请检查该节点。" };
 
     const intermediates = [];
+    const usedLinkIds = new Set();
     let terminalOutName = out0.name;
     for (let guard = 0; guard < 6; guard++) {
+        usedLinkIds.add(String(lk.id ?? lk.link_id ?? ""));
         const t = graph._nodes_by_id[lk.target_id];
         const inp = t && (t.inputs || [])[lk.target_slot];
         if (!t || !inp) return { error: "连线目标异常。" };
@@ -1535,7 +1537,7 @@ function traceMaterialChain(graph, srcNode, kind) {
             const prefix = m[1];
             const family = (t.inputs || []).filter((i) => String(i.name || "").startsWith(prefix));
             if (family.length >= 2) {
-                return { intermediates, target: t, familyPrefix: prefix, familyCount: family.length, terminalOutName };
+                return { intermediates, target: t, familyPrefix: prefix, familyCount: family.length, terminalOutName, usedLinkIds };
             }
         }
         if (!MATERIAL_INTERMEDIATES.has(t.type)) {
@@ -1586,11 +1588,16 @@ function addSiblingMaterial(srcNode, kind) {
         let cy = bottomY + 40;
         const baseX = srcNode.pos[0];
         const created = [];
+        const uniqueTitle = (t) => {
+            if (!t) return t;
+            if (!graph._nodes.some((n) => n.title === t)) return t;
+            return t + "·新";
+        };
         const mk = (type, title, copyFrom) => {
             const n = LiteGraph.createNode(type);
             if (!n) throw new Error("无法创建节点：" + type);
             graph.add(n);
-            if (title) n.title = title;
+            if (title) n.title = uniqueTitle(title);
             if (copyFrom) cloneWidgetValues(copyFrom, n, []);
             n.pos = [baseX, cy];
             cy += ((n.size && n.size[1]) || 120) + 30;
@@ -1598,27 +1605,75 @@ function addSiblingMaterial(srcNode, kind) {
             return n;
         };
 
-        let tail = null;
+        let head = null, tail = null;
         if (kind === "image") {
-            tail = mk("LoadImage", `参考图${num}`, srcNode);
+            head = tail = mk("LoadImage", `参考图${num}`, srcNode);
         } else if (kind === "audio") {
-            const la = mk("LoadAudio", `参考音频${num}`, srcNode);
+            head = mk("LoadAudio", `参考音频${num}`, srcNode);
             const tr2 = mk("TrimAudioDuration", `音频${num}修剪`, tr.intermediates[0] ? tr.intermediates[0].srcNode : null);
-            connectByName(la, 0, tr2, "audio");
+            connectByName(head, 0, tr2, "audio");
             tail = tr2;
         } else {
-            const lv = mk("LoadVideo", `参考视频${num}`, srcNode);
+            head = mk("LoadVideo", `参考视频${num}`, srcNode);
             const vs = mk("Video Slice", null, tr.intermediates[0] ? tr.intermediates[0].srcNode : null);
-            connectByName(lv, 0, vs, "video");
+            connectByName(head, 0, vs, "video");
             const gc = mk("GetVideoComponents", null, tr.intermediates[1] ? tr.intermediates[1].srcNode : null);
             connectByName(vs, 0, gc, "video");
             tail = gc;
         }
         const outIdx = (tail.outputs || []).findIndex((o) => o.name === tr.terminalOutName);
         const ok = connectByName(tail, outIdx >= 0 ? outIdx : 0, tr.target, free.name);
+
+        // 复刻源节点"其余连线"（如 LoadImage 遮罩输出 → 图片素材输入开关）：
+        // 同族输入接下一个空闲位；rgthree 类开关的末尾自动扩展空槽直接接上（它自己会重建开关）；
+        // 单一且已被原节点占用的输入跳过并在提示中说明
+        const extraWired = [], extraSkipped = [];
+        for (let si = 0; si < (srcNode.outputs || []).length; si++) {
+            const so = srcNode.outputs[si];
+            if (!Array.isArray(so.links)) continue;
+            const newOutIdx = (head.outputs || []).findIndex((o) => o.name === so.name);
+            if (newOutIdx < 0) continue;
+            for (const lid of so.links) {
+                if (tr.usedLinkIds && tr.usedLinkIds.has(String(lid))) continue;
+                const lk = graph.links[lid];
+                if (!lk) continue;
+                const T = graph._nodes_by_id[lk.target_id];
+                const S = (T.inputs || [])[lk.target_slot];
+                if (!T || !S) continue;
+                const sName = String(S.name || "");
+                let done = false;
+                const m = sName.match(/^(.*\D)(\d+)$/);
+                if (m) {
+                    const familyInputs = (T.inputs || []).filter((i) => String(i.name || "").startsWith(m[1]));
+                    if (familyInputs.length >= 2) {
+                        const f = findFreeFamilySlot(T, m[1]);
+                        if (f.free) {
+                            done = connectByName(head, newOutIdx, T, f.free.name);
+                        } else {
+                            // rgthree 开关节点特性：末尾保留一个空输入槽，接上后它自动重建开关列表
+                            const ins = T.inputs || [];
+                            const last = ins[ins.length - 1];
+                            if (last && last.link == null && !String(last.name || "") && String(last.type) === "*") {
+                                done = head.connect(newOutIdx, T, ins.length - 1);
+                            }
+                        }
+                    }
+                }
+                if (!done) {
+                    const same = (T.inputs || []).find((i) => i.name === sName && i.link == null);
+                    if (same) done = connectByName(head, newOutIdx, T, sName);
+                }
+                if (done) extraWired.push(`${so.name} →「${T.title || T.type}」`);
+                else extraSkipped.push(`${so.name} →「${T.title || T.type}.${sName || "空槽"}」`);
+            }
+        }
+
         app.canvas.setDirty(true, true);
         if (!ok) { toast("新节点已创建，但自动连接参考槽位失败，请手动连线。", "warn"); return; }
-        toast(`已新增 ${created.length} 个节点并自动连接到「${tr.target.title || tr.target.type}」的 ${free.name}（参考位 ${num}）。新节点参数复制自原节点，记得上传新素材。`);
+        toast(`已新增 ${created.length} 个节点并自动连接到「${tr.target.title || tr.target.type}」的 ${free.name}（参考位 ${num}）` +
+              (extraWired.length ? `；其余连线已同步复刻：${extraWired.join("、")}` : "") +
+              (extraSkipped.length ? `。另有 ${extraSkipped.length} 条连线未复刻（目标输入已被原节点占用）：${extraSkipped.join("、")}` : "") +
+              `。新节点参数复制自原节点，记得上传新素材。`);
     } catch (e) {
         console.error("[H3 Helper] addSiblingMaterial failed:", e);
         toast("增加素材节点失败：" + e.message, "error");
@@ -1674,4 +1729,4 @@ app.registerExtension({
     },
 });
 
-console.log("[H3 Helper] WorkflowHelper v2.0.0 已加载（新增：素材节点一键加同款 +图片/+音频/+视频，自动顺延接下一空闲参考槽位）");
+console.log("[H3 Helper] WorkflowHelper v2.1.0 已加载（加同款增强：复刻源节点全部输出连线——遮罩→素材开关也自动接，支持 rgthree 开关自动扩展槽）");
