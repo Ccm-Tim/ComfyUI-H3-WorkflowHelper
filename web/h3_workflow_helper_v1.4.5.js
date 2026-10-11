@@ -11,7 +11,7 @@
 // 删除本插件后，工作流仍是 100% 官方节点链。
 
 import { app } from "../../scripts/app.js";
-window.__H3_HELPER_VERSION = "1.9.0";
+window.__H3_HELPER_VERSION = "2.0.0";
 
 const H3_ANCHOR_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3AddGuide", "MiniMaxH3ReferenceToVideo"]);
 const H3_ROOT_TYPES = new Set(["MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo"]);
@@ -1491,11 +1491,164 @@ function layoutAll() {
     app.canvas.setDirty(true, true);
 }
 
+// ============ 六期：素材节点一键加同款（LoadImage/LoadAudio/LoadVideo 上的 +按钮） ============
+// 规则：点击已连线的素材节点上的按钮 → 复刻它的连接链（音频带修剪、视频带切片+取组件），
+// 并把链尾自动接到同一目标节点上"按序第一个空闲"的同族参考槽位（ref_image_N / ref_audio_N / ref_video_N）。
+
+const MATERIAL_INTERMEDIATES = new Set(["TrimAudioDuration", "Video Slice", "GetVideoComponents"]);
+
+function findPrimaryOutputSlot(node, type) {
+    const outs = node.outputs || [];
+    for (let i = 0; i < outs.length; i++) if (outs[i].type === type) return i;
+    return 0;
+}
+
+// 沿主输出追踪：中间节点链 → 终点（带"名称以数字结尾、同前缀多条"的族输入的目标）
+function traceMaterialChain(graph, srcNode, kind) {
+    const mainType = kind === "image" ? "IMAGE" : kind === "audio" ? "AUDIO" : "VIDEO";
+    const slot = findPrimaryOutputSlot(srcNode, mainType);
+    const out0 = (srcNode.outputs || [])[slot];
+    if (!out0 || !Array.isArray(out0.links) || out0.links.length === 0) {
+        return { error: "该节点的主输出还没有连线——先把它连到参考输入口，再用此按钮自动增加同款。" };
+    }
+    // 优先选目标输入名以 ref_ 开头的连线（R2V 的可扩展参考槽），否则取第一条
+    let lk = null;
+    for (const lid of out0.links) {
+        const l = graph.links[lid];
+        if (!l) continue;
+        const t = graph._nodes_by_id[l.target_id];
+        const inp = t && (t.inputs || [])[l.target_slot];
+        if (inp && String(inp.name || "").startsWith("ref_")) { lk = l; break; }
+    }
+    if (!lk) lk = graph.links[out0.links[0]] || null;
+    if (!lk) return { error: "连线数据异常，请检查该节点。" };
+
+    const intermediates = [];
+    let terminalOutName = out0.name;
+    for (let guard = 0; guard < 6; guard++) {
+        const t = graph._nodes_by_id[lk.target_id];
+        const inp = t && (t.inputs || [])[lk.target_slot];
+        if (!t || !inp) return { error: "连线目标异常。" };
+        const inName = String(inp.name || "");
+        const m = inName.match(/^(.*\D)(\d+)$/);
+        if (m) {
+            const prefix = m[1];
+            const family = (t.inputs || []).filter((i) => String(i.name || "").startsWith(prefix));
+            if (family.length >= 2) {
+                return { intermediates, target: t, familyPrefix: prefix, familyCount: family.length, terminalOutName };
+            }
+        }
+        if (!MATERIAL_INTERMEDIATES.has(t.type)) {
+            return { error: `该节点连到「${t.title || t.type}」的 ${inName} 输入——不是可按序扩展的参考槽位（如需在锚点加素材，请用锚点上的「＋插入参考图/音频」按钮）。` };
+        }
+        const contIdx = (t.outputs || []).findIndex((o) => Array.isArray(o.links) && o.links.length > 0);
+        if (contIdx < 0) return { error: `中间节点「${t.title || t.type}」的输出没有继续连线，无法识别目标。` };
+        const contOut = (t.outputs || [])[contIdx];
+        intermediates.push({ type: t.type, outName: contOut.name, srcNode: t });
+        terminalOutName = contOut.name;
+        const nlk = graph.links[contOut.links[0]];
+        if (!nlk) return { error: "连线数据异常。" };
+        lk = nlk;
+    }
+    return { error: "链路过长，未识别到参考槽位。" };
+}
+
+function findFreeFamilySlot(target, prefix) {
+    let free = null, total = 0;
+    (target.inputs || []).forEach((inp) => {
+        if (String(inp.name || "").startsWith(prefix)) {
+            total++;
+            if (!free && inp.link == null) {
+                const numM = String(inp.name).match(/(\d+)$/);
+                free = { name: String(inp.name), num: numM ? parseInt(numM[1], 10) : total };
+            }
+        }
+    });
+    return { free, total };
+}
+
+function addSiblingMaterial(srcNode, kind) {
+    try {
+        const graph = app.graph;
+        const tr = traceMaterialChain(graph, srcNode, kind);
+        if (tr.error) { toast(tr.error, "warn"); return; }
+        const { free, total } = findFreeFamilySlot(tr.target, tr.familyPrefix);
+        if (!free) {
+            toast(`目标节点的 ${tr.familyPrefix}N 参考槽位（共 ${total} 个）已全部占用，无法再增加；如需替换请先断开其中一个。`, "error");
+            return;
+        }
+        const num = free.num + 1; // 展示编号沿用用户习惯：槽位 0 → 1 号
+
+        // 放置：原链最底节点的正下方（如与现有节点重叠请自行拖动）
+        const chainNodes = [srcNode, ...tr.intermediates.map((x) => x.srcNode)];
+        let bottomY = -Infinity;
+        for (const n of chainNodes) bottomY = Math.max(bottomY, n.pos[1] + ((n.size && n.size[1]) || 120));
+        let cy = bottomY + 40;
+        const baseX = srcNode.pos[0];
+        const created = [];
+        const mk = (type, title, copyFrom) => {
+            const n = LiteGraph.createNode(type);
+            if (!n) throw new Error("无法创建节点：" + type);
+            graph.add(n);
+            if (title) n.title = title;
+            if (copyFrom) cloneWidgetValues(copyFrom, n, []);
+            n.pos = [baseX, cy];
+            cy += ((n.size && n.size[1]) || 120) + 30;
+            created.push(n);
+            return n;
+        };
+
+        let tail = null;
+        if (kind === "image") {
+            tail = mk("LoadImage", `参考图${num}`, srcNode);
+        } else if (kind === "audio") {
+            const la = mk("LoadAudio", `参考音频${num}`, srcNode);
+            const tr2 = mk("TrimAudioDuration", `音频${num}修剪`, tr.intermediates[0] ? tr.intermediates[0].srcNode : null);
+            connectByName(la, 0, tr2, "audio");
+            tail = tr2;
+        } else {
+            const lv = mk("LoadVideo", `参考视频${num}`, srcNode);
+            const vs = mk("Video Slice", null, tr.intermediates[0] ? tr.intermediates[0].srcNode : null);
+            connectByName(lv, 0, vs, "video");
+            const gc = mk("GetVideoComponents", null, tr.intermediates[1] ? tr.intermediates[1].srcNode : null);
+            connectByName(vs, 0, gc, "video");
+            tail = gc;
+        }
+        const outIdx = (tail.outputs || []).findIndex((o) => o.name === tr.terminalOutName);
+        const ok = connectByName(tail, outIdx >= 0 ? outIdx : 0, tr.target, free.name);
+        app.canvas.setDirty(true, true);
+        if (!ok) { toast("新节点已创建，但自动连接参考槽位失败，请手动连线。", "warn"); return; }
+        toast(`已新增 ${created.length} 个节点并自动连接到「${tr.target.title || tr.target.type}」的 ${free.name}（参考位 ${num}）。新节点参数复制自原节点，记得上传新素材。`);
+    } catch (e) {
+        console.error("[H3 Helper] addSiblingMaterial failed:", e);
+        toast("增加素材节点失败：" + e.message, "error");
+    }
+}
+
 // ============ 注册 ============
 
 app.registerExtension({
     name: "H3.WorkflowHelper",
     beforeRegisterNodeDef(nodeType, nodeData) {
+        // 素材节点一键加同款按钮（LoadImage/LoadAudio/LoadVideo）
+        const MATERIAL_BUTTONS = {
+            "LoadImage": { label: "＋ 增加图片", kind: "image" },
+            "LoadAudio": { label: "＋ 增加音频", kind: "audio" },
+            "LoadVideo": { label: "＋ 增加视频", kind: "video" },
+        };
+        const matDef = MATERIAL_BUTTONS[nodeData.name];
+        if (matDef) {
+            const prevCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                const r = prevCreated ? prevCreated.apply(this, arguments) : undefined;
+                const self = this;
+                const w = this.addWidget("button", matDef.label, null, () => addSiblingMaterial(self, matDef.kind));
+                try { w.serialize = false; } catch (e) { /* 忽略 */ }
+                const wi = this.widgets.indexOf(w);
+                if (wi > 0) { this.widgets.splice(wi, 1); this.widgets.unshift(w); }
+                return r;
+            };
+        }
         const isAnchor = H3_ANCHOR_TYPES.has(nodeData.name);
         const isRoot = nodeData.name === "MiniMaxH3ImageToVideo";
         const isR2VRoot = nodeData.name === "MiniMaxH3ReferenceToVideo";
@@ -1521,4 +1674,4 @@ app.registerExtension({
     },
 });
 
-console.log("[H3 Helper] WorkflowHelper v1.6.0 已加载（延长视频：附属分组泛化——带内附属组随主段位移，「段N视频与抽卡视频切换」组独立堆叠到上一段切换组正下方，组外 Set 节点按名收编）");
+console.log("[H3 Helper] WorkflowHelper v2.0.0 已加载（新增：素材节点一键加同款 +图片/+音频/+视频，自动顺延接下一空闲参考槽位）");
